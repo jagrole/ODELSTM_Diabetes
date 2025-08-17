@@ -1,0 +1,717 @@
+import torch
+import torch.nn as nn
+from torchdyn.core import NeuralODE
+import pytorch_lightning as pl
+from torchmetrics.functional import accuracy
+import numpy as np
+import os
+import torch.nn.functional as F
+import torch.optim as optim
+import pymatreader
+import argparse
+import matplotlib.pyplot as plt
+import pickle
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from torchmetrics import Accuracy
+from torchdiffeq import odeint
+from torch.distributions.normal import Normal
+from torch.distributions import kl_divergence, Independent
+
+class OR_ODE_Func(nn.Module):
+	
+	def __init__(self, param):
+		super(OR_ODE_Func, self).__init__()
+		self.param = param
+		self.hidden_layer = nn.Linear(self.param['LO_hidden_size'], self.param['OF_layer_dim'])
+		self.tanh = nn.Tanh()
+		self.hidden_layer2 = nn.Linear(self.param['OF_layer_dim'], self.param['OF_layer_dim'])
+		self.tanh2 = nn.Tanh()
+		self.output_layer = nn.Linear(self.param['OF_layer_dim'], self.param['LO_hidden_size'])
+		
+	def forward(self, t, input):
+		x = input
+		x = self.hidden_layer(x)
+		x = self.tanh(x)
+		x = self.hidden_layer2(x)
+		x = self.tanh2(x)
+		x = self.output_layer(x)	
+		return x
+	
+		
+class GRU(nn.Module):
+    def __init__(self, param):
+        super(GRU, self).__init__()
+        self.param = param
+        D = self.param['LO_hidden_size']
+        H = self.param['GRU_unit']
+
+
+        # Update gate: input dim = OR_hidden_size + 2 (mean, std, CGM+insulin)
+        self.update_gate = nn.Sequential(
+            nn.Linear(2 * D + 2, H),
+            nn.Tanh(),
+            nn.Linear(H, D),
+            nn.Sigmoid()
+        )
+        # Reset gate: input dim = OR_hidden_size + 2
+        self.reset_gate = nn.Sequential(
+            nn.Linear(2 * D + 2, H),
+            nn.Tanh(),
+            nn.Linear(H, D),
+            nn.Sigmoid()
+        )
+        # New‐state network: input dim = OR_hidden_size + 2
+        self.new_state_net = nn.Sequential(
+            nn.Linear(2 * D + 2, H),
+            nn.Tanh(),
+            nn.Linear(H, 2 * D)
+        )
+
+    def forward(self, mean, std, x, mask):
+
+        y = torch.cat([mean, std, x], dim=-1)  # shape (batch_size, OR_hidden_size + 2)
+        update = self.update_gate(y)           # (batch_size, LO_hidden_size)
+        reset = self.reset_gate(y)             # (batch_size, LO_hidden_size)
+
+        y_reset = torch.cat([mean * reset, std * reset, x], dim=-1)
+        new_state_output = self.new_state_net(y_reset)  
+
+        new_mean = new_state_output[:, : self.param['LO_hidden_size']]
+        new_std = new_state_output[:, self.param['LO_hidden_size'] :]
+
+        final_mean = (1 - update) * new_mean + update * mean
+        final_std = (1 - update) * new_std + update * std
+
+        m_float = mask.float().unsqueeze(1)        # (batch_size, 1)
+        inv_m = (1.0 - mask.float()).unsqueeze(1)  # (batch_size, 1)
+
+        final_mean = m_float * final_mean + inv_m * mean
+        final_std  = m_float * final_std  + inv_m * std
+
+        return final_mean, final_std.abs()
+        # final_mean = mask.reshape(-1, 1) * final_mean + (1 - mask).reshape(-1, 1) * mean
+        # final_std = mask.reshape(-1, 1) * final_std + (1 - mask).reshape(-1, 1) * std
+
+        # return final_mean, final_std.abs()
+
+
+
+class ODE_RNN(nn.Module):
+    def __init__(self, param):
+        super(ODE_RNN, self).__init__()
+        self.param = param
+        self.ode_func = OR_ODE_Func(param)
+        self.gru = GRU(param)
+        # register mean0 and std0 as buffers so .to(device) works
+        self.register_buffer("mean0", torch.zeros(self.param['batch_size'], self.param['LO_hidden_size']))
+        self.register_buffer("std0", torch.zeros(self.param['batch_size'], self.param['LO_hidden_size']))
+
+    # def forward(self, input_tuple):
+    #     b, m, train_m, _ = input_tuple
+    #     # b: (batch_size, total_points, 3) = [time, CGM, insulin]
+    #     # m, train_m: (batch_size, total_points)
+
+    #     # Step 1: Integrate from time_horizon → last observed time
+    #     mean_ode = odeint(
+    #         self.ode_func,
+    #         self.mean0,
+    #         torch.tensor([self.param['time_horizon'], b[0, -1, 0]], device=self.param['device']),
+    #         rtol=self.param['rtol'],
+    #         atol=self.param['atol']
+    #     )[1]
+
+    #     # Step 2: Feed CGM+insulin at final observed index into GRU
+    #     x_last = b[:, -1, 1:3]  # (batch_size, 2)
+    #     mean, std = self.gru(mean_ode, self.std0, x_last, train_m[:, -1])
+
+    #     # Step 3: Loop backwards over earlier time‐steps
+    #     for i in range(b.shape[1] - 2, -1, -1):
+    #         mean_ode = odeint(
+    #             self.ode_func,
+    #             mean,
+    #             torch.tensor([b[0, i + 1, 0], b[0, i, 0]], device=self.param['device']),
+    #             rtol=self.param['rtol'],
+    #             atol=self.param['atol']
+    #         )[1]
+    #         x_i = b[:, i, 1:3]  # (batch_size, 2)
+    #         mean, std = self.gru(mean_ode, std, x_i, train_m[:, i])
+
+    #     return mean, std
+    def forward(self, input_tuple):
+        b, m, train_m, _ = input_tuple
+        # b:       (batch_size, total_points, 3) = [time, CGM, insulin]
+        # m:       (batch_size, total_points)     presence mask (unused internally)
+        # train_m: (batch_size, total_points)     boolean mask for encoder steps
+        # _ (test_m) is not used by the encoder
+
+        D = self.param['LO_hidden_size']
+
+        # ─── Integrate from first observed time → last observed time ───────────────────
+        start_t = b[0, 0, 0]     # first timestamp in the batch (e.g. could be 0, could be >0)
+        end_t   = b[0, -1, 0]    # last timestamp
+        times   = torch.tensor([start_t, end_t], device=self.param['device'])
+        
+        # If end_t == start_t, dt=0. In practice we assume T_in + T_out ≥ 2 so dt>0.
+        mean_ode = odeint(self.ode_func, self.mean0, times,
+                          rtol=self.param['rtol'], atol=self.param['atol'])[1]  # (batch_size, D)
+
+        # ─── GRU update at the final observed time‐index (i = -1) ────────────────────
+        x_last = b[:, -1, 1:3]  # (batch_size, 2)  ← CGM and insulin
+        mean, std = self.gru(mean_ode, self.std0, x_last, train_m[:, -1])  # each: (batch_size, D)
+
+        # ─── Loop backwards through earlier time points ───────────────────────────────
+        T = b.shape[1]
+        for i in range(T - 2, -1, -1):
+            t_pair = torch.tensor([b[0, i + 1, 0], b[0, i, 0]], device=self.param['device'])
+            mean_ode = odeint(self.ode_func, mean, t_pair,
+                              rtol=self.param['rtol'], atol=self.param['atol'])[1]  # (batch_size, D)
+
+            x_i = b[:, i, 1:3]  # (batch_size, 2)
+            mean, std = self.gru(mean_ode, std, x_i, train_m[:, i])
+
+        return mean, std
+
+class LO_ODE_Func(nn.Module):
+	
+	def __init__(self, param):
+		super(LO_ODE_Func, self).__init__()
+		self.param = param
+		self.hidden_layer = nn.Linear(self.param['LO_hidden_size'], self.param['OF_layer_dim'])
+		self.hidden_tanh = nn.Tanh()
+		self.hidden_layer2 = nn.Linear(self.param['OF_layer_dim'], self.param['OF_layer_dim'])
+		self.hidden_tanh2 = nn.Tanh()
+		self.output_layer = nn.Linear(self.param['OF_layer_dim'], self.param['LO_hidden_size'])
+		
+	def forward(self, t, input):
+		x = input
+		x = self.hidden_layer(x)
+		x = self.hidden_tanh(x)
+		x = self.hidden_layer2(x)
+		x = self.hidden_tanh2(x)
+		x = self.output_layer(x)
+		return x
+class Latent_ODE(nn.Module):
+    def __init__(self, param):
+        super(Latent_ODE, self).__init__()
+        self.param = param
+        self.ode_func = LO_ODE_Func(param)
+        self.ode_rnn = ODE_RNN(param)
+        self.output_output = nn.Sequential(
+            nn.Linear(self.param['LO_hidden_size'], 1),
+        )
+        self.mse_func = nn.MSELoss()
+
+    def forward(self, input, kl_coef):
+        b, m, train_m, test_m = input
+        # b: (batch_size, total_points, 3)
+
+        # Encode: get mean, std
+        mean, std = self.ode_rnn(input)  # each: (batch_size, LO_hidden_size)
+
+        # Sample z0
+        d = Normal(torch.tensor([0.0], device=self.param['device']), torch.tensor([1.0], device=self.param['device']))
+        r = d.sample(mean.shape).squeeze(-1)
+        z0 = mean + r * std  # (batch_size, LO_hidden_size)
+
+        # Decode latent → continuous trajectory using the first example’s time‐vector
+        z_out = odeint(
+            self.ode_func,
+            z0,
+            b[0, :, 0],  # assuming all examples share the same time‐grid
+            rtol=self.param['rtol'],
+            atol=self.param['atol']
+        )  # (T, batch_size, LO_hidden_size)
+        z_out = z_out.permute(1, 0, 2)  # (batch_size, T, LO_hidden_size)
+
+        output = self.output_output(z_out).squeeze(2)  # (batch_size, T)
+
+        # KL divergence term
+        z0_distr = Normal(mean, std)
+        kl_div = kl_divergence(
+            z0_distr,
+            Normal(torch.tensor([0.0], device=self.param['device']), torch.tensor([1.0], device=self.param['device']))
+        )  # (batch_size, LO_hidden_size)
+        kl_div = kl_div.mean(dim=1)  # (batch_size,)
+
+        # Reconstruction: only CGM channel (b[:,:,1]) is target
+        masked_output = output[test_m.bool()].reshape(
+            self.param['batch_size'],
+            self.param['total_points'] - self.param['obs_points']
+        )  # (batch_size, T_out)
+        target = b[:, :, 1][test_m.bool()].reshape(
+            self.param['batch_size'],
+            self.param['total_points'] - self.param['obs_points']
+        )  # (batch_size, T_out)
+
+        gaussian = Independent(Normal(loc=masked_output, scale=self.param['obsrv_std']), 1)
+        log_prob = gaussian.log_prob(target)  # (batch_size,)
+        likelihood = log_prob / output.shape[1]
+
+        loss = -torch.logsumexp(likelihood - kl_coef * kl_div, 0)
+        mse = self.mse_func(masked_output, target)
+
+        return loss, mse, masked_output
+
+class LatentSequenceLearner(pl.LightningModule):
+    def __init__(self, param: dict, kl_coef: float, lr: float):
+        super().__init__()
+        self.save_hyperparameters(ignore=["param"])
+        self.param = param
+        self.kl_coef = kl_coef
+        self.lr = lr
+
+        self.model = Latent_ODE(self.param)
+        self.mse_loss = nn.MSELoss()
+        self._val_outputs = []
+
+    def forward(self, batch):
+        return self.model(batch, kl_coef=self.kl_coef)
+
+    def training_step(self, batch, batch_idx):
+        b, m, train_m, test_m = batch
+        elbo_loss, mse_val, _ = self.model((b, m, train_m, test_m), kl_coef=self.kl_coef)
+        self.log("train/elbo_loss", elbo_loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/mse", mse_val, prog_bar=False, on_step=True, on_epoch=True)
+        # Also log a generic “train_loss” so callbacks can pick it up:
+        self.log("train_loss", elbo_loss, prog_bar=False, on_step=False, on_epoch=True)
+        return elbo_loss
+
+    def validation_step(self, batch, batch_idx):
+        b, m, train_m, test_m = batch
+        elbo_loss, mse_val, recon = self.model((b, m, train_m, test_m), kl_coef=self.kl_coef)
+        self.log("val/elbo_loss", elbo_loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val/mse", mse_val, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_loss", elbo_loss, prog_bar=False, on_step=False, on_epoch=True)
+
+        # Store reconstruction and true CGM for plotting later
+        batch_size = self.param['batch_size']
+        T_out = self.param['total_points'] - self.param['obs_points']
+        self._val_outputs.append({
+            "recon": recon.detach().cpu(),  # (batch_size, T_out)
+            "true": b[:, :, 1][test_m.bool()].reshape(batch_size, T_out).detach()
+        })
+    def on_validation_epoch_end(self):
+        if not self._val_outputs:
+            return
+
+        all_recons = torch.cat([out["recon"] for out in self._val_outputs], dim=0)
+        all_trues  = torch.cat([out["true"]  for out in self._val_outputs], dim=0)
+        n_to_plot  = min(10, all_recons.size(0))
+        T_future   = all_recons.size(1)
+
+        fig, axes = plt.subplots(nrows=n_to_plot, ncols=1,
+                                 figsize=(8, 2.5 * n_to_plot),
+                                 sharex=True)
+
+        if n_to_plot == 1:
+            axes = [axes]
+
+        for i, ax in enumerate(axes):
+            xs = np.arange(T_future)
+
+            # Move back to CPU before calling .numpy()
+            ax.scatter(
+                xs,
+                all_trues[i].cpu().numpy(),
+                label="True",
+                marker="o",
+                s=30,
+                alpha=0.8,
+            )
+
+            ax.scatter(
+                xs,
+                all_recons[i].cpu().numpy(),
+                label="Reconstruction",
+                marker="x",
+                s=30,
+                alpha=0.8,
+            )
+
+            ax.set_ylabel("CGM")
+            ax.set_title(f"Val Sample {i}")
+            ax.legend(loc="upper right", fontsize="small")
+            ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.3)
+
+        axes[-1].set_xlabel("Future Time Steps")
+        plt.tight_layout()
+        os.makedirs("latent_ode_plots", exist_ok=True)
+        plt.savefig(f"latent_ode_plots/val_epoch_{self.current_epoch}.png")
+        plt.close(fig)
+        self._val_outputs.clear()
+
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.model.parameters(), lr=self.lr)
+
+class Data_builder():
+    def __init__(self, data_mat, ins_path, batch_size, gap_threshold, seq_len):
+        super().__init__()
+        self.data_full = data_mat
+        self.batch_size = batch_size
+        self.ins_path = ins_path
+        self.gap_threshold = gap_threshold
+        self.seq_len = seq_len
+        # self.sequences = self.setup()
+
+    def gap_checker(time_series, gap):
+        time_series = np.array(time_series)
+        time_diff = np.diff(time_series)
+
+        return np.any(time_diff > gap)
+
+    def user_dict_maker(self):
+        data_all = self.data_full
+        gap_threshold = self.gap_threshold
+        good_user_idx_list = []
+        good_user_dict = {}
+        list_data = []
+            
+        for idx, data in enumerate(data_all['pkf']['cgm']):
+            cur_CGM_data = data_all['pkf']['cgm'][idx]
+            cur_timedata = data_all['pkf']['timecgm'][idx]
+            temp = np.array(cur_timedata)
+            cur_diffs = np.diff(temp)
+            if not np.any(cur_diffs > gap_threshold):
+                good_id = data_all['pkf']['ID'][idx]
+                list_data = [good_id, idx]
+                good_user_idx_list.append(list_data)
+        
+        for idx, data in enumerate(good_user_idx_list):
+            original_idx = data[1]
+            cur_str = str(data[0])
+            key_list = [
+                original_idx,
+                data_all['pkf']['Sex'][idx],
+                data_all['pkf']['BMI'][idx],
+                data_all['pkf']['AgeMed'][idx],
+                data_all['pkf']['Q'][idx]['Weight_kg_value'],
+                data_all['pkf']['Q'][idx]['Height_cm_value']
+                ]
+            good_user_dict[cur_str] = key_list
+            
+        women_dict = {k: v for k, v in good_user_dict.items() if v[1] == 'Kvinde'}
+        women_idx = [value[0] for value in women_dict.values()]
+        men_dict = {k: v for k, v in good_user_dict.items() if v[1] == 'Mand'}
+        men_idx  = [value[0] for value in men_dict.values()]
+
+        return men_dict, women_dict, men_idx, women_idx
+
+    def find_outliers(data_dict):
+        first_values = [group[1] for group in data_dict.values() if len(group) > 1]
+        Q1 = np.percentile(first_values, 30)
+        Q3 = np.percentile(first_values, 60)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        outliers_dict = {
+            key: group for key, group in data_dict.items() if group[1] < lower_bound or group[1] > upper_bound
+        } 
+
+        return outliers_dict
+    
+    def assemble_data(self, idx_list, ins_data):
+        segmented_CGM_data = []
+        segmented_timedata = []
+        segmented_ins_data = []
+        data_all = self.data_full
+        for idx in idx_list:
+            curr_CGM_data = data_all['pkf']['cgm'][idx]
+            segmented_CGM_data.append(curr_CGM_data)
+            curr_timedata = data_all['pkf']['timecgm'][idx]
+            segmented_timedata.append(curr_timedata)
+            segmented_ins_data.append(ins_data[idx])
+ 
+
+        return segmented_CGM_data, segmented_timedata, segmented_ins_data
+    
+    def outlier_deleter(self, data_dict, outliers):
+        new_dict = data_dict.copy()
+        for key in outliers.keys():
+            cur = key
+            del new_dict[cur]
+
+        return new_dict
+
+
+    def load_ins(self, path):
+        self.folder_path = path
+        files = [f for f in os.listdir(self.folder_path) if f.endswith(".pkl")]
+        
+        files.sort(key=lambda x: int(os.path.splitext(x)[0]))
+        
+        data_list = []
+        for filename in files:
+            file_path = os.path.join(self.folder_path, filename)
+            with open(file_path, 'rb') as file:
+                data = pickle.load(file)
+
+            data_list.append(data)
+        
+        return data_list
+
+
+    def prepare_data(self):
+        ins_path = self.ins_path
+        self.ins_data = self.load_ins(ins_path)
+        self.CGM_data = self.data_full['pkf']['cgm']
+        men_dict, women_dict, men_idx, women_idx  = self.user_dict_maker()
+        # men_outliers = self.find_outliers(men_dict)
+        # men_dict = self.outlier_deleter(men_dict, men_outliers)
+
+        seg_CGM, seg_time, seg_ins = self.assemble_data(men_idx, self.ins_data)
+        # CGM_conc = np.concatenate(seg_CGM)
+        # time_conc = np.concatenate(seg_time)
+        # ins_conc = np.concatenate(seg_ins)
+        self.coords = []
+        for x, y, t in zip(seg_CGM, seg_ins, seg_time):
+            cur = self.create_coordinates(x,y,t)
+            self.coords.append(cur)
+        return self.coords, men_idx
+        # return CGM_conc, time_conc, ins_conc
+
+    def create_coordinates(self, values_x, values_y, values_t):
+        coord_list = [] 
+        for i in range(len(values_x)):
+            x_cur = values_x[i]
+            y_cur = values_y[i]
+            t_cur = values_t[i]
+            list_ = torch.tensor([x_cur, y_cur, t_cur], dtype=torch.float32)
+            coord_list.append(list_)
+
+        return torch.stack(coord_list)
+
+
+
+    def create_sequences(
+        self,
+        coords: torch.Tensor,
+        seq_len_in: int,
+        seq_len_out: int
+    ):
+
+        seq_list = []
+        N = coords.size(0)
+        total_len = seq_len_in + seq_len_out
+
+        # We can only form windows if N >= T_in+T_out
+        for i in range(N - total_len + 1):
+            window = coords[i : i + total_len]  # shape: (T_in+T_out, 3)
+
+            # 1) Extract absolute times and compute deltas
+            abs_times = window[:, 2].cpu().numpy()   # e.g. array of length T_in+T_out
+            deltas = np.concatenate([[0.0], np.diff(abs_times)])  # length T_in+T_out
+
+            # 2) Split deltas into past vs. future
+            t_in_deltas  = torch.from_numpy(deltas[0:seq_len_in]).float()    # (T_in,)
+            t_out_deltas = torch.from_numpy(deltas[seq_len_in : total_len]).float()  # (T_out,)
+
+            # 3) Prepare x_in = [CGM, insulin] for past steps
+            x_in = window[0:seq_len_in, 0:2].clone()   # (T_in, 2)
+
+            # 4) Prepare y_out = future CGMs
+            y_out = window[seq_len_in : total_len, 0].clone()  # (T_out,)
+
+            # Now append this one training sample
+            seq_list.append((x_in, t_in_deltas, t_out_deltas, y_out))
+
+        return seq_list
+
+    
+def split_on_large_gaps(coords: torch.Tensor, max_gap_steps: int, T_in: int, T_out: int):
+    abs_times = coords[:, 2].cpu().numpy()
+    diffs = np.diff(abs_times)
+    step_gaps = diffs / 5.0
+    break_indices = np.where(step_gaps > max_gap_steps)[0]
+
+    segments = []
+    prev_idx = 0
+    for idx in break_indices:
+        seg = coords[prev_idx: idx + 1].clone()
+        if seg.shape[0] >= (T_in + T_out):
+            segments.append(seg)
+        prev_idx = idx + 1
+
+    final_seg = coords[prev_idx:].clone()
+    if final_seg.shape[0] >= (T_in + T_out):
+        segments.append(final_seg)
+
+    return segments
+
+def make_latent_ode_example(coords: torch.Tensor, seq_len_in: int, seq_len_out: int, max_steps: int):
+    N = coords.size(0)
+    total_len = seq_len_in + seq_len_out
+    examples = []
+
+    for i in range(N - total_len + 1):
+        window = coords[i: i + total_len]  # (total_len, 3)
+
+        raw_times = window[:, 2].cpu().numpy()
+        diffs = np.diff(raw_times)
+        step_gaps = diffs / 5.0
+        deltas = np.concatenate([[0.0], step_gaps])
+        deltas = np.minimum(deltas, max_steps)
+
+        b_time = window[:, 2].clone()
+        b_cgm = window[:, 0].clone()
+        b_ins = window[:, 1].clone()
+        b = torch.stack([b_time, b_cgm, b_ins], dim=1).float()  # (total_len, 3)
+
+        m = torch.ones(total_len, dtype=torch.float32)
+        train_m = torch.zeros(total_len, dtype=torch.bool)
+        train_m[:seq_len_in] = True
+        test_m = torch.zeros(total_len, dtype=torch.bool)
+        test_m[seq_len_in:] = True
+
+        examples.append((b, m, train_m, test_m))
+
+    return examples
+
+class LatentODEDataset(Dataset):
+    def __init__(self, coords_list, seq_len_in, seq_len_out, max_steps):
+        super().__init__()
+        self.seq_len_in = seq_len_in
+        self.seq_len_out = seq_len_out
+        self.max_steps = max_steps
+        self.examples = []
+        for coords in coords_list:
+            self.examples.extend(make_latent_ode_example(coords, seq_len_in, seq_len_out, max_steps))
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]  # (b, m, train_m, test_m)
+    
+
+def latent_ode_collate_fn(batch):
+    b_list, m_list, train_m_list, test_m_list = zip(*batch)
+    b_batch = torch.stack(b_list, dim=0)
+    m_batch = torch.stack(m_list, dim=0)
+    train_m_batch = torch.stack(train_m_list, dim=0)
+    test_m_batch = torch.stack(test_m_list, dim=0)
+    return b_batch, m_batch, train_m_batch, test_m_batch
+
+class LossLogger(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.train_losses = []
+        self.val_losses = []
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        train_loss = trainer.callback_metrics.get("train_loss")
+        if train_loss is not None:
+            self.train_losses.append(train_loss.cpu().item())
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        val_loss = trainer.callback_metrics.get("val_loss")
+        if val_loss is not None:
+            self.val_losses.append(val_loss.cpu().item())
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data_full = pymatreader.read_mat("/home/jagrole/AAU/9.Sem/Data/Processed_data_ALL.mat")
+    ins_path = "/home/jagrole/AAU/9.Sem/Data/processed_insulin_data/take2"
+
+    T_in = 80
+    T_out = 20
+    max_steps = 30
+    gap_threshold = 200
+    batch_size = 32
+    lr = 1e-4
+    max_epochs = 100
+
+    data_builder = Data_builder(
+        data_mat=data_full,
+        ins_path=ins_path,
+        batch_size=batch_size,
+        gap_threshold=gap_threshold,
+        seq_len=None
+    )
+    coords_list_all, _ = data_builder.prepare_data()
+
+    filtered_segments = []
+    for coords in coords_list_all:
+        segments = split_on_large_gaps(coords, max_gap_steps=gap_threshold, T_in=T_in, T_out=T_out)
+        filtered_segments.extend(segments)
+
+    latent_dataset = LatentODEDataset(
+        coords_list=filtered_segments,
+        seq_len_in=T_in,
+        seq_len_out=T_out,
+        max_steps=max_steps
+    )
+    total_count = len(latent_dataset)
+    val_size = int(0.2 * total_count)
+    train_size = total_count - val_size
+
+    generator = torch.Generator().manual_seed(42)
+    train_ds, val_ds = random_split(latent_dataset, [train_size, val_size], generator=generator)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=latent_ode_collate_fn,
+        drop_last=True,
+        num_workers=4,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=latent_ode_collate_fn,
+        drop_last=True,
+        num_workers=4,
+    )
+
+    param = {
+        "LO_hidden_size": 64,
+        "OF_layer_dim": 128,
+        "OR_hidden_size": 64,
+        "GRU_unit": 128,
+        "rtol": 1e-3,
+        "atol": 1e-4,
+        "device": device,
+        "batch_size": batch_size,
+        "time_horizon": 0.0,
+        "total_points": T_in + T_out,
+        "obs_points": T_in,
+        "obsrv_std": 0.1,
+    }
+    kl_coef = 0.01
+    learner = LatentSequenceLearner(param=param, kl_coef=kl_coef, lr=lr)
+    loss_logger = LossLogger()
+
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator="auto",
+        devices=1 if torch.cuda.is_available() else None,
+        log_every_n_steps=10,
+        gradient_clip_val=1.0,
+        callbacks=[loss_logger]
+    )
+    trainer.fit(learner, train_loader, val_loader)
+
+    # Optional: Plot train/val losses
+    train_losses = loss_logger.train_losses
+    val_losses = loss_logger.val_losses
+    epochs_train = np.arange(1, len(train_losses) + 1)
+    epochs_val = np.arange(1, len(val_losses) + 1)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(epochs_train, train_losses, label="Train Loss")
+    ax.plot(epochs_val, val_losses, label="Val Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training vs. Validation Loss")
+    ax.legend()
+    ax.grid(True)
+    plt.show()
+    fig.savefig("loss_curves.png")
+    print("Saved loss curves to loss_curves.png")
+
+
+if __name__ == "__main__":
+    main()

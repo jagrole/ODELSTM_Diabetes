@@ -1,0 +1,779 @@
+import time
+import torch
+import torch.nn as nn
+from torchdyn.core import NeuralODE
+import pytorch_lightning as pl
+from torchmetrics.functional import accuracy
+import numpy as np
+import os
+import torch.nn.functional as F
+import torch.optim as optim
+import pytorch_lightning as pl
+import pymatreader
+import argparse
+import matplotlib.pyplot as plt
+import pickle
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from torchmetrics import Accuracy
+from torchdiffeq import odeint_adjoint as odeint
+from pytorch_lightning.callbacks import ModelCheckpoint
+
+
+class ODELSTMCell(nn.Module):
+    def __init__(self, input_size, hidden_size, solver_type):
+        super(ODELSTMCell, self).__init__()
+        self.solver_type = solver_type
+        self.fixed_step_solver = solver_type.startswith("fixed_")
+        self.lstm = nn.LSTMCell(input_size, hidden_size)
+        # 1 hidden layer NODE
+        self.f_node = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        if not self.fixed_step_solver:
+            self.node = NeuralODE(self.f_node, solver=solver_type, atol=1e-3, rtol=1e-2)
+        else:
+            options = {
+                "fixed_euler": self.euler,
+                "fixed_heun": self.heun,
+                "fixed_rk4": self.rk4,
+            }
+            if not solver_type in options.keys():
+                raise ValueError("Unknown solver type '{:}'".format(solver_type))
+            self.node = options[self.solver_type]
+
+    def forward(self, input, hx, ts):
+        new_h, new_c = self.lstm(input, hx)
+        if self.fixed_step_solver:
+            new_h = self.solve_fixed(new_h, ts)
+        else:
+            batch_size = ts.size(0)
+            indices = torch.argsort(ts)
+            device = input.device
+            s_sort = ts[indices]
+            s_sort = s_sort + torch.linspace(0, 1e-4, batch_size, device=device)
+            # HACK: Make sure no two points are equal
+            trajectory = self.node.trajectory(new_h, s_sort)
+            new_h = trajectory[indices, torch.arange(batch_size, device=device)]
+
+        return (new_h, new_c)
+
+    def solve_fixed(self, x, ts):
+        ts = ts.view(-1, 1)
+        for i in range(5):  # 3 unfolds
+            x = self.node(x, ts * (1.0 / 5))
+        return x
+
+    def euler(self, y, delta_t):
+        dy = self.f_node(y)
+        return y + delta_t * dy
+
+    def heun(self, y, delta_t):
+        k1 = self.f_node(y)
+        k2 = self.f_node(y + delta_t * k1)
+        return y + delta_t * 0.5 * (k1 + k2)
+
+    def rk4(self, y, delta_t):
+        k1 = self.f_node(y)
+        k2 = self.f_node(y + k1 * delta_t * 0.5)
+        k3 = self.f_node(y + k2 * delta_t * 0.5)
+        k4 = self.f_node(y + k3 * delta_t)
+
+        return y + delta_t * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
+
+
+class ODELSTM(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_size,
+        out_feature,
+        solver_type,
+        return_sequences=True,
+    ):
+        super(ODELSTM, self).__init__()
+        self.in_features = in_features
+        self.hidden_size = hidden_size
+        self.out_feature = out_feature
+        self.return_sequences = return_sequences
+
+        self.rnn_cell = ODELSTMCell(in_features, hidden_size, solver_type=solver_type)
+        self.fc = nn.Linear(self.hidden_size, self.out_feature)
+
+    def forward(
+        self,
+        x_in:  torch.Tensor,  # (batch, T_in, in_features)
+        t_in:  torch.Tensor,  # (batch, T_in)
+        t_out: torch.Tensor   # (batch, T_out)
+    ) -> torch.Tensor:
+        batch_size, T_in, _ = x_in.shape
+        T_out = t_out.size(1)
+
+        device = x_in.device
+
+        hidden_state = [
+            torch.zeros((batch_size, self.hidden_size), device=device),
+            torch.zeros((batch_size, self.hidden_size), device=device),
+        ]
+
+        for t in range(T_in):
+            input_t = x_in[:, t, :]        # shape (batch, in_features)
+            delta_t = t_in[:, t]           # shape (batch,)
+            hidden_state = self.rnn_cell(input_t, hidden_state, delta_t)
+            # hidden_state = (h_t, c_t) for time‐step t
+
+        preds = []
+        for j in range(T_out):
+           
+            future_input = torch.zeros((batch_size, self.in_features), device=device)
+
+            delta_t_future = t_out[:, j]   # shape (batch,)
+            hidden_state = self.rnn_cell(future_input, hidden_state, delta_t_future)
+            h_j = hidden_state[0]   # h_j: (batch, hidden_size)
+            pred_j = self.fc(h_j)   # shape (batch, 1)
+            preds.append(pred_j)
+
+        
+        preds = torch.stack(preds, dim=1)      # shape :(batch, T_out, 1)
+        preds = preds.squeeze(-1)              # shape :(batch, T_out)
+
+        return preds
+
+
+class IrregularSequenceLearner(pl.LightningModule):
+
+    def __init__(
+            self,
+            model: ODELSTM,
+            solver_type,
+            T_in,
+            T_out,
+            hidden_size,
+            lr):
+        
+        super().__init__()
+        self.model = model
+        self.lr = lr
+        self.criterion = nn.MSELoss()
+        self.solver_type = solver_type
+        self.T_in = T_in
+        self.T_out = T_out
+        self.hidden_size = hidden_size
+        self._val_outputs = []
+        self.save_hyperparameters()
+
+    def training_step(self, batch, batch_idx):
+        x_in, t_in, t_out, y_out = batch
+        y_hat = self.model(x_in, t_in, t_out)   # shape = (batch, T_out)
+        loss = self.criterion(y_hat.view(-1), y_out.view(-1))
+
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x_in, t_in, t_out, y_out = batch
+        y_hat = self.model(x_in, t_in, t_out)
+        loss = self.criterion(y_hat.view(-1), y_out.view(-1))
+
+        self.log("val_loss", loss, prog_bar=True)
+        self._val_outputs.append({
+            "y_hat": y_hat.detach().cpu(),
+            "y_true": y_out.detach().cpu(),
+        })
+        return {
+        "loss": loss,
+        "y_hat": y_hat.detach().cpu(),
+        "y_true": y_out.detach().cpu(),
+        }
+    def on_validation_epoch_end(self):
+
+        y_hats = torch.cat([out['y_hat'] for out in self._val_outputs], dim=0)
+        y_trues = torch.cat([out['y_true'] for out in self._val_outputs], dim=0)
+
+        n_samples_to_plot = 20
+        num_samples = y_hats.size(0)
+        T_out = y_hats.size(1)
+
+        # Create a figure with one row per sample, shared x‐axis for alignment
+        fig, axes = plt.subplots(
+            nrows=min(n_samples_to_plot, num_samples),
+            ncols=1,
+            figsize=(12, 2.5 * min(n_samples_to_plot, num_samples)),
+            sharex=True,
+        )
+
+        if min(n_samples_to_plot, num_samples) == 1:
+            # If there's only one subplot, wrap it in a list so we can index uniformly
+            axes = [axes]
+
+        for i, ax in enumerate(axes):
+            # Safety: break if we run out of actual validation samples
+            if i >= num_samples:
+                break
+
+            # x‐axis = 0,1,2,…,T_out−1
+            xs = np.arange(T_out)
+
+            # Plot “True” as blue circles
+            ax.scatter(
+                xs,
+                y_trues[i].numpy(),
+                label='True',
+                marker='o',
+                s=30,           # slightly larger dots
+                alpha=0.8,
+            )
+
+            # Plot “Predicted” as red crosses
+            ax.scatter(
+                xs,
+                y_hats[i].numpy(),
+                label='Predicted',
+                marker='x',
+                s=30,
+                alpha=0.8,
+            )
+
+            ax.set_ylabel("CGM value")
+            ax.set_title(f"Validation sample {i}")
+            ax.legend(loc='upper right', fontsize='small')
+
+            # Optional: if you want gridlines for easier comparison:
+            ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.3)
+
+        # Label the shared x‐axis on the bottom subplot
+        axes[-1].set_xlabel("Future time step index")
+
+        plt.tight_layout()
+
+        os.makedirs("plots", exist_ok=True)
+        plt.savefig(f"plots/val_pred_vs_true_epoch{self.current_epoch}.png")
+        plt.close(fig)
+
+        self._val_outputs.clear()
+
+    def test_step(self, batch, batch_idx):
+        return self.validation_step(batch, batch_idx)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.model.parameters(), lr=self.lr)
+    
+
+
+
+class Data_builder():
+    def __init__(self, data_mat, ins_path, batch_size, gap_threshold, seq_len):
+        super().__init__()
+        self.data_full = data_mat
+        self.batch_size = batch_size
+        self.ins_path = ins_path
+        self.gap_threshold = gap_threshold
+        self.seq_len = seq_len
+        # self.sequences = self.setup()
+
+    def gap_checker(time_series, gap):
+        time_series = np.array(time_series)
+        time_diff = np.diff(time_series)
+
+        return np.any(time_diff > gap)
+
+    def user_dict_maker(self):
+        data_all = self.data_full
+        gap_threshold = self.gap_threshold
+        good_user_idx_list = []
+        good_user_dict = {}
+        list_data = []
+            
+        for idx, data in enumerate(data_all['pkf']['cgm']):
+            cur_CGM_data = data_all['pkf']['cgm'][idx]
+            cur_timedata = data_all['pkf']['timecgm'][idx]
+            temp = np.array(cur_timedata)
+            cur_diffs = np.diff(temp)
+            if not np.any(cur_diffs > gap_threshold):
+                good_id = data_all['pkf']['ID'][idx]
+                list_data = [good_id, idx]
+                good_user_idx_list.append(list_data)
+        
+        for idx, data in enumerate(good_user_idx_list):
+            original_idx = data[1]
+            cur_str = str(data[0])
+            key_list = [
+                original_idx,
+                data_all['pkf']['Sex'][idx],
+                data_all['pkf']['BMI'][idx],
+                data_all['pkf']['AgeMed'][idx],
+                data_all['pkf']['Q'][idx]['Weight_kg_value'],
+                data_all['pkf']['Q'][idx]['Height_cm_value']
+                ]
+            good_user_dict[cur_str] = key_list
+            
+        women_dict = {k: v for k, v in good_user_dict.items() if v[1] == 'Kvinde'}
+        women_idx = [value[0] for value in women_dict.values()]
+        men_dict = {k: v for k, v in good_user_dict.items() if v[1] == 'Mand'}
+        men_idx  = [value[0] for value in men_dict.values()]
+
+        return men_dict, women_dict, men_idx, women_idx
+
+    def find_outliers(data_dict):
+        first_values = [group[1] for group in data_dict.values() if len(group) > 1]
+        Q1 = np.percentile(first_values, 30)
+        Q3 = np.percentile(first_values, 60)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        outliers_dict = {
+            key: group for key, group in data_dict.items() if group[1] < lower_bound or group[1] > upper_bound
+        } 
+
+        return outliers_dict
+    
+    def assemble_data(self, idx_list, ins_data):
+        segmented_CGM_data = []
+        segmented_timedata = []
+        segmented_ins_data = []
+        data_all = self.data_full
+        for idx in idx_list:
+            curr_CGM_data = data_all['pkf']['cgm'][idx]
+            segmented_CGM_data.append(curr_CGM_data)
+            curr_timedata = data_all['pkf']['timecgm'][idx]
+            segmented_timedata.append(curr_timedata)
+            segmented_ins_data.append(ins_data[idx])
+ 
+
+        return segmented_CGM_data, segmented_timedata, segmented_ins_data
+    
+    def outlier_deleter(self, data_dict, outliers):
+        new_dict = data_dict.copy()
+        for key in outliers.keys():
+            cur = key
+            del new_dict[cur]
+
+        return new_dict
+
+
+    def load_ins(self, path):
+        self.folder_path = path
+        # Get a list of all pickle files in the folder
+        files = [f for f in os.listdir(self.folder_path) if f.endswith(".pkl")]
+        
+        # Sort files numerically based on the file name (without extension)
+        files.sort(key=lambda x: int(os.path.splitext(x)[0]))
+        
+        # Load files in sorted order into a list
+        data_list = []
+        for filename in files:
+            file_path = os.path.join(self.folder_path, filename)
+            
+            # Load the pickle file
+            with open(file_path, 'rb') as file:
+                data = pickle.load(file)
+            
+            # Append the data to the list
+            data_list.append(data)
+        
+        return data_list
+
+
+    def prepare_data(self):
+        ins_path = self.ins_path
+        self.ins_data = self.load_ins(ins_path)
+        self.CGM_data = self.data_full['pkf']['cgm']
+        men_dict, women_dict, men_idx, women_idx  = self.user_dict_maker()
+        # men_outliers = self.find_outliers(men_dict)
+        # men_dict = self.outlier_deleter(men_dict, men_outliers)
+
+        seg_CGM, seg_time, seg_ins = self.assemble_data(men_idx, self.ins_data)
+        # CGM_conc = np.concatenate(seg_CGM)
+        # time_conc = np.concatenate(seg_time)
+        # ins_conc = np.concatenate(seg_ins)
+        self.coords = []
+        for x, y, t in zip(seg_CGM, seg_ins, seg_time):
+            cur = self.create_coordinates(x,y,t)
+            self.coords.append(cur)
+        return self.coords, men_idx
+        # return CGM_conc, time_conc, ins_conc
+
+    def create_coordinates(self, values_x, values_y, values_t):
+        coord_list = [] 
+        for i in range(len(values_x)):
+            x_cur = values_x[i]
+            y_cur = values_y[i]
+            t_cur = values_t[i]
+        # t_cur = times[i]
+            # list_ = [x_cur, y_cur, t_cur]
+            list_ = torch.tensor([x_cur, y_cur, t_cur], dtype=torch.float32)
+            coord_list.append(list_)
+
+        return torch.stack(coord_list)
+
+
+    # def create_sequences(self, coords, times, seq_len):
+    #     seq_list = []
+    #     for i in range(len(coords) - seq_len + 1):
+    #         seq_x = coords[i:i + seq_len]
+    #         seq_y = times[i:i + seq_len]
+    #         seq_list.append((seq_x, seq_y))
+
+    #     return seq_list
+    def create_sequences(
+        self,
+        coords: torch.Tensor,
+        seq_len_in: int,
+        seq_len_out: int
+    ):
+        """
+        coords:       (N, 3)  tensor of [CGM, insulin, absolute_time]
+        seq_len_in:   T_in   (how many past steps to feed the model)
+        seq_len_out:  T_out  (how many future CGMs to predict)
+
+        Returns: a list of tuples (x_in, t_in, t_out, y_out), where:
+          - x_in:  (T_in, 2)      = [CGM, insulin] for each past step
+          - t_in:  (T_in,)        = time‐gaps between those T_in absolute times
+          - t_out: (T_out,)       = time‐gaps for each future step
+          - y_out: (T_out,)       = actual CGM values of the next T_out steps
+        """
+
+        seq_list = []
+        N = coords.size(0)
+        total_len = seq_len_in + seq_len_out
+
+        # We can only form windows if N >= T_in+T_out
+        for i in range(N - total_len + 1):
+            window = coords[i : i + total_len]  # shape: (T_in+T_out, 3)
+
+            # 1) Extract absolute times and compute deltas
+            abs_times = window[:, 2].cpu().numpy()   # e.g. array of length T_in+T_out
+            deltas = np.concatenate([[0.0], np.diff(abs_times)])  # length T_in+T_out
+
+            # 2) Split deltas into past vs. future
+            t_in_deltas  = torch.from_numpy(deltas[0:seq_len_in]).float()    # (T_in,)
+            t_out_deltas = torch.from_numpy(deltas[seq_len_in : total_len]).float()  # (T_out,)
+
+            # 3) Prepare x_in = [CGM, insulin] for past steps
+            x_in = window[0:seq_len_in, 0:2].clone()   # (T_in, 2)
+
+            # 4) Prepare y_out = future CGMs
+            y_out = window[seq_len_in : total_len, 0].clone()  # (T_out,)
+
+            # Now append this one training sample
+            seq_list.append((x_in, t_in_deltas, t_out_deltas, y_out))
+
+        return seq_list
+
+    def setup(self):
+        cgm_conc, time_conc, ins_conc = self.prepare_data()
+        self.coords = self.create_coordinates(cgm_conc, ins_conc)
+        self.time_conc = time_conc
+        self.sequences = self.create_sequences(self.coords, self.time_conc, self.seq_len)
+
+        return self.sequences
+    
+class CGMForecastDataset(Dataset):
+    def __init__(self, sequence_list):
+        """
+        sequence_list: list of tuples (x_in, t_in, t_out, y_out), where
+          x_in:  torch.Tensor (T_in, in_features)
+          t_in:  torch.Tensor (T_in,)
+          t_out: torch.Tensor (T_out,)
+          y_out: torch.Tensor (T_out,)
+        """
+        self.sequences = sequence_list
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return self.sequences[idx]
+
+
+def collate_fn(batch):
+    """
+    batch is a list of length=BATCH_SIZE, each item = (x_in, t_in, t_out, y_out).
+    We want to stack them into:
+      x_in_batch:  (B, T_in,  in_features)
+      t_in_batch:  (B, T_in)
+      t_out_batch: (B, T_out)
+      y_out_batch: (B, T_out)
+    """
+    x_ins   = [item[0] for item in batch]
+    t_ins   = [item[1] for item in batch]
+    t_outs  = [item[2] for item in batch]
+    y_outs  = [item[3] for item in batch]
+
+    x_in_batch = torch.stack(x_ins,  dim=0)  # (B, T_in, 2)
+    t_in_batch = torch.stack(t_ins,  dim=0)  # (B, T_in)
+    t_out_batch= torch.stack(t_outs, dim=0)  # (B, T_out)
+    y_out_batch= torch.stack(y_outs, dim=0)  # (B, T_out)
+
+    return x_in_batch, t_in_batch, t_out_batch, y_out_batch
+
+class LossLogger(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.train_losses = []
+        self.val_losses   = []
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        train_loss = trainer.callback_metrics.get("train_loss")
+        if train_loss is not None:
+            self.train_losses.append(train_loss.cpu().item())
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        val_loss = trainer.callback_metrics.get("val_loss")
+        if val_loss is not None:
+            self.val_losses.append(val_loss.cpu().item())
+
+
+
+def main():
+    start_time = time.time()  
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=str, default=None, 
+                        help="Path to checkpoint to resume training")
+    args = parser.parse_args()
+
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    last_ckpt_path = os.path.join(checkpoint_dir, "last.ckpt")
+    ckpt_path = None
+
+        # Check if checkpoint exists
+    if os.path.exists(last_ckpt_path):
+        print(f"\nFound existing checkpoint: {last_ckpt_path}")
+        # Ask user if they want to resume
+        resume = input("Do you want to resume training from this checkpoint? (y/n): ").strip().lower()
+        if resume == 'y':
+            ckpt_path = last_ckpt_path
+            print("Resuming training from checkpoint...")
+        else:
+            print("Starting fresh training...")
+    else:
+        print("No checkpoint found. Starting fresh training...")
+    
+
+
+    # LOAD DATA AND INSTATIATE DEVICE
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    data_full = pymatreader.read_mat('/home/jagrole/AAU/9.Sem/Data/Processed_data_ALL.mat')   
+    ins_path = '/home/jagrole/AAU/9.Sem/Data/processed_insulin_data/take2'
+
+
+    #HPARAMS :::::::::::::::::::::::::::::::::::::::::::::::::::
+    solver_type = 'fixed_heun'
+    batch_size = 32
+    T_in  = 160     # past steps
+    T_out = 80 # future steps
+    lr = 1e-4
+    gap_threshold = 200
+    hidden_size = 256
+    max_epochs = 400
+    # step_size = 1/5
+
+    data_builder = Data_builder(
+        data_mat      = data_full,
+        ins_path      = ins_path,
+        batch_size    = batch_size,
+        gap_threshold = gap_threshold,
+        seq_len       = None  
+    )
+    def split_on_large_gaps(coords: torch.Tensor, max_gap_steps: int):
+
+        #timestamps
+        abs_times = coords[:, 2].cpu().numpy() 
+
+        diffs = np.diff(abs_times)  # raw minute‐gaps
+
+        step_gaps = diffs / 5.0
+
+        # find indices where step_gaps > max_gap_steps
+        break_indices = np.where(step_gaps > max_gap_steps)[0]
+
+        # break positions used to slice coords
+        segments = []
+        prev_idx = 0
+        for idx in break_indices:
+            seg = coords[prev_idx : idx + 1].clone()
+            if seg.shape[0] >= (T_in + T_out): 
+                segments.append(seg)
+            prev_idx = idx + 1
+        final_seg = coords[prev_idx:].clone()
+        if final_seg.shape[0] >= (T_in + T_out):
+            segments.append(final_seg)
+
+        return segments
+    def create_sequences_clamp_deltas(
+        coords: torch.Tensor,
+        seq_len_in: int,
+        seq_len_out: int,
+        max_steps: int
+    ):
+        seq_list = []
+        N = coords.size(0)
+        total_len = seq_len_in + seq_len_out
+
+        abs_times = coords[:, 2].cpu().numpy()
+
+        for i in range(N - total_len + 1):
+            window = coords[i : i + total_len]  # shape (T_in+T_out, 3)
+
+            
+            abs_window = window[:, 2].cpu().numpy()
+            diffs = np.diff(abs_window)        
+            step_gaps = diffs / 5.0            
+            deltas = np.concatenate([[0.0], step_gaps])  # length T_in+T_out
+
+            # clamp any gap > max_steps to max_steps
+            deltas = np.minimum(deltas, max_steps)
+
+            # convert to float tensor
+            deltas = torch.from_numpy(deltas).float()  # (T_in+T_out,)
+
+            # split into t_in, t_out
+            t_in  = deltas[0:seq_len_in]               # (T_in,)
+            t_out = deltas[seq_len_in : total_len]     # (T_out,)
+
+            # inputs = past CGM & insulin
+            x_in  = window[0:seq_len_in, 0:2].clone()   # (T_in, 2)
+
+            # labels or targets = future CGM
+            y_out = window[seq_len_in : total_len, 0].clone()  # (T_out,)
+
+            seq_list.append((x_in, t_in, t_out, y_out))
+
+        return seq_list
+    
+    # cant remember if this is needed anywhere so its staying for now
+    # all_sequences = []
+    # for coords in coords_list:
+    #     seqs = data_builder.create_sequences(coords, T_in, T_out)
+    #     all_sequences.extend(seqs)
+
+    coords_list, men_idx = data_builder.prepare_data()
+    print(men_idx)
+    single_coords = coords_list[7]
+    print(single_coords.size())
+    all_sequences = data_builder.create_sequences(single_coords, T_in, T_out)
+    all_sequences = []
+    # for coords in single_coords:
+    # 1) split at any gap > 200 steps (i.e. > 16.7 hours)
+    segments = split_on_large_gaps(single_coords, max_gap_steps=200)
+    
+    for seg in segments:
+        # 2) within each segment, clamp any large delta t, above 30 steps = 2.5 hours
+        seqs = create_sequences_clamp_deltas(seg, T_in, T_out, max_steps=30)
+        all_sequences.extend(seqs)
+    generator = torch.Generator()#.manual_seed(42) # <=============== SEED IF NEEDED
+    total_count = len(all_sequences)
+    val_size    = int(0.2 * total_count)
+    train_size  = total_count - val_size
+
+    train_seqs, val_seqs = random_split(
+        all_sequences, 
+        [train_size, val_size],
+        generator=generator
+    )
+    train_dataset = CGMForecastDataset(train_seqs)
+    val_dataset   = CGMForecastDataset(val_seqs)
+
+    
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",          # Monitor validation loss
+        dirpath="checkpoints",       # Directory to save checkpoints
+        filename="best_model",       # File name prefix
+        save_top_k=1,                # Save only the best model
+        mode="min",                  # Minimize the monitored metric
+        save_last=True,              # Also save last model for resuming
+        every_n_epochs=1,            # Save every epoch
+    )
+    # CODE FOR APPLYING TO FULL DATASET, NOT NEEDED FOR SINGLE
+    # all_sequences = []
+    #     for coords in coords_list:                     # coords_list already has (Ni,3) per ID
+    #         sub_segments = split_on_large_gaps(coords, max_gap_steps=200)
+    #         for seg in sub_segments:
+    #             seqs = data_builder.create_sequences(seg, T_in, T_out)
+    #             all_sequences.extend(seqs)
+    # print(all_sequences[0])
+
+    # INSTANTIATE MODEL, LEARNER, TRAINER AND DATALOADERS
+    dataset = CGMForecastDataset(all_sequences)
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size = 32,
+        shuffle = False,
+        collate_fn = collate_fn,
+        drop_last = True,
+        num_workers = 4,
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size = 32,
+        shuffle = False,
+        collate_fn = collate_fn,
+        drop_last = True,
+        num_workers = 4,
+    )
+
+    model = ODELSTM(
+        in_features = 2,
+        hidden_size = hidden_size,
+        out_feature = 1,
+        solver_type = solver_type 
+    )
+    model = model.to(device)
+    
+    learner = IrregularSequenceLearner(
+            model,
+            solver_type,
+            T_in,
+            T_out,
+            hidden_size,
+            lr)
+    
+    loss_logger = LossLogger()
+
+    # TRAINER
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator="auto",
+        devices=1 if torch.cuda.is_available() else None,
+        callbacks = [loss_logger, checkpoint_callback], 
+        log_every_n_steps=10,
+        gradient_clip_val=1.0,
+    )
+
+    #BEGIN TRAINING
+    # ckpt_path = args.resume if args.resume else None
+    trainer.fit(learner, train_dataloader, val_dataloader, ckpt_path=ckpt_path)
+    
+    train_losses = loss_logger.train_losses  # list of floats, length = num train epochs
+    val_losses   = loss_logger.val_losses
+    epochs_train = np.arange(1, len(train_losses) + 1)
+    epochs_val   = np.arange(1, len(val_losses)   + 1)
+
+#   plots
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(epochs_train, train_losses, label="Train Loss")
+    ax.plot(epochs_val[1:],   val_losses[1:],   label="Val Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE Loss")
+    ax.set_title("Training vs. Validation Loss")
+    ax.legend()
+    ax.grid(True)
+
+    plt.show()   
+    fig.savefig("loss_curves.png")
+    print("Saved loss curves to loss_curves.png")
+    total_time = time.time() - start_time
+    hours = int(total_time // 3600)
+    minutes = int((total_time % 3600) // 60)
+    seconds = total_time % 60
+    print(f"\nTotal execution time: {hours}h {minutes}m {seconds:.2f}s")
+if __name__ == "__main__":
+    main()
+    
